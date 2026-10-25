@@ -21,10 +21,11 @@ const (
 	renderAPIBase            = "https://api.render.com/v1"
 	defaultRenderAnycastIP   = "216.24.57.1"
 	defaultRNReqTimeout      = 15 * time.Second
-	defaultRNCertPollTick    = 6 * time.Second
+	defaultRNCertPollTick    = 10 * time.Second
 	defaultRNCertPollWait    = 90 * time.Second
 	defaultRNTLSProbeTimeout = 4 * time.Second
 	defaultRNTargetPort      = 8080
+	minRNRequestInterval     = 500 * time.Millisecond
 )
 
 type rnAPIError struct {
@@ -94,6 +95,9 @@ type RenderClient struct {
 	TargetPort  int
 	apiBase     string
 	client      *http.Client
+
+	reqMu   sync.Mutex
+	lastReq time.Time
 
 	mu               sync.RWMutex
 	serviceDomain    string
@@ -253,9 +257,36 @@ func (c *RenderClient) baseURL() string {
 	return renderAPIBase
 }
 
+func (c *RenderClient) paceAPIRequest(ctx context.Context) error {
+	c.reqMu.Lock()
+	defer c.reqMu.Unlock()
+
+	if !c.lastReq.IsZero() {
+		elapsed := time.Since(c.lastReq)
+		if elapsed < minRNRequestInterval {
+			wait := minRNRequestInterval - elapsed
+			t := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				if !t.Stop() {
+					<-t.C
+				}
+				return ctx.Err()
+			case <-t.C:
+			}
+		}
+	}
+	c.lastReq = time.Now()
+	return nil
+}
+
 func doRNRequest(ctx context.Context, c *RenderClient, method, path string, body any) ([]byte, int, error) {
 	if !c.IsConfigured() {
 		return nil, 0, errors.New("render client not configured")
+	}
+
+	if err := c.paceAPIRequest(ctx); err != nil {
+		return nil, 0, err
 	}
 
 	var reqBytes []byte
@@ -286,7 +317,7 @@ func doRNRequest(ctx context.Context, c *RenderClient, method, path string, body
 		if body != nil {
 			req.Header.Set("Content-Type", "application/json")
 		}
-		req.Header.Set("User-Agent", "Bermuda-Edge-Router/4.0")
+		req.Header.Set("User-Agent", "curl/8.7.1")
 
 		resp, doErr := c.client.Do(req)
 		if doErr != nil {
@@ -307,7 +338,7 @@ func doRNRequest(ctx context.Context, c *RenderClient, method, path string, body
 			select {
 			case <-ctx.Done():
 				return nil, resp.StatusCode, ctx.Err()
-			case <-time.After(1500 * time.Millisecond):
+			case <-time.After(2500 * time.Millisecond):
 				continue
 			}
 		}
@@ -460,7 +491,7 @@ func (c *RenderClient) ResolveRuntimeContext(ctx context.Context) error {
 	}
 
 	c.applyServiceMetadata(selected)
-	log.Printf("[Render] ✓ Resolved Runtime Service Context: %s (%s)", selected.ID, selected.Name)
+	log.Printf("[Render] ✓ Service context resolved: %s (%s)", selected.ID, selected.Name)
 	return nil
 }
 
@@ -489,19 +520,17 @@ func (c *RenderClient) PersistMasterKey(ctx context.Context, masterKey string) b
 	if err := c.UpsertVariable(ctx, "BERMUDA_MASTER_KEY", strings.TrimSpace(masterKey)); err != nil {
 		var apiErr *rnAPIError
 		if errors.As(err, &apiErr) && apiErr.IsPermissionOrPlan() {
-			log.Printf("[Render] Note: Auto-persisting BERMUDA_MASTER_KEY skipped (token permission restriction)")
 			return false
 		}
-		log.Printf("[Render] Warning: Could not persist BERMUDA_MASTER_KEY to Render Environment Variables: %v", err)
+		log.Printf("[Render] Notice: Environment variable sync skipped: %v", err)
 		return false
 	}
-	log.Println("[Render] ✓ BERMUDA_MASTER_KEY persisted atomically to Render Service Environment Variables")
+	log.Println("[Render] ✓ BERMUDA_MASTER_KEY synchronized to Service Environment")
 	return true
 }
 
 func (c *RenderClient) EnsureServiceDomain(ctx context.Context) (string, error) {
 	if dom := c.GetServiceDomain(); isFullRenderServiceDomain(dom) {
-		log.Printf("[Render] ✓ Service Domain Verified: %s (Port %d)", dom, c.TargetPort)
 		return dom, nil
 	}
 
@@ -515,7 +544,6 @@ func (c *RenderClient) EnsureServiceDomain(ctx context.Context) (string, error) 
 	c.mu.RUnlock()
 
 	if isFullRenderServiceDomain(dom) {
-		log.Printf("[Render] ✓ Service Domain Discovered: %s (Port %d)", dom, c.TargetPort)
 		return dom, nil
 	}
 
@@ -529,11 +557,7 @@ func (c *RenderClient) EnsureServiceDomain(ctx context.Context) (string, error) 
 		}
 	}
 
-	dom = c.GetServiceDomain()
-	if dom != "" {
-		log.Printf("[Render] ✓ Service Domain Verified: %s (Port %d)", dom, c.TargetPort)
-	}
-	return dom, nil
+	return c.GetServiceDomain(), nil
 }
 
 type rnCustomDomainServer struct {
@@ -684,8 +708,8 @@ func (c *RenderClient) EnsureCustomDomain(ctx context.Context, targetDomain stri
 				c.SetCustomDomain(cleanTarget)
 				c.notifyTopology()
 				info := c.toCustomDomainInfo(ctx, cd)
-				log.Printf("[Render] ✓ Custom Domain Already Registered: %s (ID: %s, CNAME Target: %s, VerifyStatus: %s, CertStatus: %s)",
-					cleanTarget, info.ID, info.CNAMETarget, info.VerificationStatus, info.CertificateStatus)
+				log.Printf("[Render] ✓ Custom Domain Verified: %s (CNAME Target: %s, Status: %s)",
+					cleanTarget, info.CNAMETarget, info.CertificateStatus)
 				return info, nil
 			}
 		}
@@ -747,8 +771,7 @@ func (c *RenderClient) EnsureCustomDomain(ctx context.Context, targetDomain stri
 	c.notifyTopology()
 	info := c.toCustomDomainInfo(ctx, matched)
 
-	log.Printf("[Render] ✓ Auto-Registered Custom Domain: %s -> CNAME Target: %s (ID: %s, CertStatus: %s)",
-		cleanTarget, info.CNAMETarget, info.ID, info.CertificateStatus)
+	log.Printf("[Render] ✓ Registered Custom Domain: %s -> %s", cleanTarget, info.CNAMETarget)
 	return info, nil
 }
 
@@ -777,12 +800,25 @@ func (c *RenderClient) TriggerCustomDomainVerify(ctx context.Context, customDoma
 	if err != nil {
 		return false
 	}
-	log.Printf("[Render] ✓ Triggered DNS & TLS verification check on Render for %s", cleanHost(targetDomain))
+	log.Printf("[Render] ✓ Requested DNS verification for %s", cleanHost(targetDomain))
 	return true
 }
 
 func (c *RenderClient) FetchCustomDomainStatus(ctx context.Context, customDomainID, targetDomain string) (*RenderCustomDomainInfo, error) {
 	cleanTarget := cleanHost(targetDomain)
+	cnameTarget := c.GetServiceDomain()
+
+	if probeCustomDomainTLS(ctx, cleanTarget, cnameTarget) {
+		return &RenderCustomDomainInfo{
+			ID:                 customDomainID,
+			Domain:             cleanTarget,
+			CNAMETarget:        cnameTarget,
+			VerificationStatus: "verified",
+			CertificateStatus:  "VALID",
+			RecordsVerified:    true,
+		}, nil
+	}
+
 	if err := c.ResolveRuntimeContext(ctx); err == nil {
 		c.mu.RLock()
 		srvID := c.ServiceID
@@ -803,26 +839,6 @@ func (c *RenderClient) FetchCustomDomainStatus(ctx context.Context, customDomain
 		}
 	}
 
-	if doms, err := c.listCustomDomains(ctx); err == nil {
-		for _, cd := range doms {
-			if (customDomainID != "" && cd.ID == customDomainID) || (cleanTarget != "" && cleanHost(cd.Name) == cleanTarget) {
-				return c.toCustomDomainInfo(ctx, cd), nil
-			}
-		}
-	}
-
-	cnameTarget := c.GetServiceDomain()
-	if probeCustomDomainTLS(ctx, cleanTarget, cnameTarget) {
-		return &RenderCustomDomainInfo{
-			ID:                 customDomainID,
-			Domain:             cleanTarget,
-			CNAMETarget:        cnameTarget,
-			VerificationStatus: "verified",
-			CertificateStatus:  "VALID",
-			RecordsVerified:    true,
-		}, nil
-	}
-
 	return &RenderCustomDomainInfo{
 		ID:                 customDomainID,
 		Domain:             cleanTarget,
@@ -839,30 +855,42 @@ func (c *RenderClient) WaitCustomDomainCertificate(ctx context.Context, customDo
 	waitCtx, cancel := context.WithTimeout(ctx, maxWait)
 	defer cancel()
 
+	cleanTarget := cleanHost(targetDomain)
+	cnameTarget := c.GetServiceDomain()
+
 	ticker := time.NewTicker(defaultRNCertPollTick)
 	defer ticker.Stop()
 
-	var latest *RenderCustomDomainInfo
-	pollCount := 0
-	for {
-		if pollCount%2 == 1 {
-			c.TriggerCustomDomainVerify(waitCtx, customDomainID, targetDomain)
-		}
-		pollCount++
+	retryVerifySent := false
+	startedAt := time.Now()
 
-		info, err := c.FetchCustomDomainStatus(waitCtx, customDomainID, targetDomain)
-		if err == nil && info != nil {
-			latest = info
-			if info.IsCertificateValid() {
-				log.Printf("[Render] ✓ Custom Domain %s TLS Certificate ISSUED & VALID (%s)",
-					info.Domain, info.CertificateStatus)
-				return info, true
-			}
+	for {
+		if probeCustomDomainTLS(waitCtx, cleanTarget, cnameTarget) {
+			log.Printf("[Render] ✓ Custom Domain %s TLS Certificate ACTIVE", cleanTarget)
+			return &RenderCustomDomainInfo{
+				ID:                 customDomainID,
+				Domain:             cleanTarget,
+				CNAMETarget:        cnameTarget,
+				VerificationStatus: "verified",
+				CertificateStatus:  "VALID",
+				RecordsVerified:    true,
+			}, true
+		}
+
+		if !retryVerifySent && time.Since(startedAt) >= 30*time.Second {
+			retryVerifySent = true
+			c.TriggerCustomDomainVerify(waitCtx, customDomainID, cleanTarget)
 		}
 
 		select {
 		case <-waitCtx.Done():
-			return latest, false
+			return &RenderCustomDomainInfo{
+				ID:                 customDomainID,
+				Domain:             cleanTarget,
+				CNAMETarget:        cnameTarget,
+				VerificationStatus: "pending",
+				CertificateStatus:  "PENDING_TLS",
+			}, false
 		case <-ticker.C:
 		}
 	}
@@ -879,16 +907,16 @@ func probeKernelIPv6Route() bool {
 
 func (c *RenderClient) TuneComputeAndNetwork(ctx context.Context) {
 	if probeKernelIPv6Route() {
-		log.Println("[Render] ✓ Outbound IPv6 Stack: ACTIVE & VERIFIED (Kernel IPv6 routing table online)")
+		log.Println("[Render] ✓ Outbound IPv6 Stack: ACTIVE")
 	} else {
-		log.Println("[Render] ✓ Outbound Network Stack: IPv4 Active (Standard IPv4 egress routing verified)")
+		log.Println("[Render] ✓ Outbound Network Stack: IPv4 Active")
 	}
 
 	if !c.IsConfigured() {
 		return
 	}
-	if err := c.ResolveRuntimeContext(ctx); err != nil {
-		return
+	if !c.HasServiceContext() {
+		_ = c.ResolveRuntimeContext(ctx)
 	}
 
 	c.mu.RLock()
@@ -899,6 +927,6 @@ func (c *RenderClient) TuneComputeAndNetwork(ctx context.Context) {
 	c.mu.RUnlock()
 
 	healthPath := getEnv("BERMUDA_HEALTH_PATH", "/healthz")
-	log.Printf("[Render] ✓ Compute & Network Verified: Service=%s | Domain=%s | Region=%s | Port=%d | HealthPath=%s",
+	log.Printf("[Render] ✓ Service Ready: ID=%s | Domain=%s | Region=%s | Port=%d | HealthPath=%s",
 		srvID, srvDom, reg, port, healthPath)
 }
