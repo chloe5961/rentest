@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: bermuda-portal
+    runtime: go
+    region: frankfurt
+    plan: free
+    buildCommand: CGO_ENABLED=0 GOOS=linux go build -trimpath -tags netgo,osusergo -ldflags="-s -w" -o ./bin/bermuda-portal .
+    startCommand: ./bin/bermuda-portal
+    healthCheckPath: /healthz
+    maxShutdownDelaySeconds: 30
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: "8080"
+      - key: TZ
+        value: "UTC"
+      - key: GOGC
+        value: "100"
+      - key: GODEBUG
+        value: "madvdontneed=1"
+      - key: BERMUDA_REGION
+        value: "frankfurt"
+      - key: BERMUDA_MASTER_KEY
+        generateValue: true
+      - key: CLOUDFLARE_API_TOKEN
+        sync: false
+      - key: RENDER_API_KEY
+        sync: false
+      - key: CUSTOM_DOMAIN
+        sync: false
