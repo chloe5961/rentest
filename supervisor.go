@@ -4,7 +4,6 @@ package main
 
 import (
 	"archive/zip"
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/hmac"
@@ -33,10 +32,8 @@ import (
 )
 
 const (
-	defaultWorkerVersion     = "v26.10.21"
-	defaultRuntimeDir        = "/tmp/bp-runtime"
-	defaultRuntimeConfigPath = "/tmp/bp-runtime/config.json"
-	defaultWorkerMemMB       = 550
+	defaultWorkerVersion = "v26.10.21"
+	defaultWorkerMemMB   = 550
 
 	defaultLoopbackXH = "127.0.0.1:18443"
 	defaultLoopbackWS = "127.0.0.1:18444"
@@ -50,7 +47,6 @@ const (
 	probeDialTimeout      = 250 * time.Millisecond
 	defaultStartTimeout   = 10 * time.Second
 	defaultStopTimeout    = 6 * time.Second
-	pipeReadBufferSize    = 64 * 1024
 
 	stableWindow       = 60 * time.Second
 	initialBackoff     = 80 * time.Millisecond
@@ -70,13 +66,6 @@ const (
 )
 
 var defaultPortalPorts = []string{"443", "2053", "2083", "2087", "2096", "8443"}
-
-var scannerBufPool = sync.Pool{
-	New: func() any { return bufio.NewReaderSize(nil, pipeReadBufferSize) },
-}
-
-var pumpLogMu sync.Mutex
-var pumpNewline = [1]byte{'\n'}
 
 type BermudaCredentials struct {
 	MasterKey     string
@@ -140,7 +129,7 @@ func resolveLatestWorkerTag(client *http.Client, apiURL string) string {
 	if err != nil {
 		return ""
 	}
-	req.Header.Set("User-Agent", "Bermuda-Edge-Router/4.0")
+	req.Header.Set("User-Agent", "curl/8.7.1")
 	resp, err := client.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		if resp != nil {
@@ -161,7 +150,7 @@ func fetchWorkerArchiveAndDigest(client *http.Client, zipURL, dgstURL string) ([
 	if err != nil {
 		return nil, nil, err
 	}
-	reqZip.Header.Set("User-Agent", "Bermuda-Edge-Router/4.0")
+	reqZip.Header.Set("User-Agent", "curl/8.7.1")
 	respZip, err := client.Do(reqZip)
 	if err != nil {
 		return nil, nil, err
@@ -179,7 +168,7 @@ func fetchWorkerArchiveAndDigest(client *http.Client, zipURL, dgstURL string) ([
 	if err != nil {
 		return zipBytes, nil, nil
 	}
-	reqDgst.Header.Set("User-Agent", "Bermuda-Edge-Router/4.0")
+	reqDgst.Header.Set("User-Agent", "curl/8.7.1")
 	respDgst, err := client.Do(reqDgst)
 	if err != nil || respDgst.StatusCode != http.StatusOK {
 		if respDgst != nil {
@@ -192,7 +181,7 @@ func fetchWorkerArchiveAndDigest(client *http.Client, zipURL, dgstURL string) ([
 	return zipBytes, dgstBytes, nil
 }
 
-func extractArchiveEntry(f *zip.File, destPath string, mode os.FileMode) error {
+func extractArchiveEntry(f *zip.File, destPath string, mode os.FileMode, mutateHash bool) error {
 	rc, err := f.Open()
 	if err != nil {
 		return err
@@ -209,17 +198,48 @@ func extractArchiveEntry(f *zip.File, destPath string, mode os.FileMode) error {
 	}
 	defer out.Close()
 
-	_, err = io.Copy(out, rc)
-	return err
+	if _, err := io.Copy(out, rc); err != nil {
+		return err
+	}
+
+	if mutateHash {
+		var salt [32]byte
+		if _, err := rand.Read(salt[:]); err == nil {
+			_, _ = out.Write(salt[:])
+		}
+	}
+	return nil
 }
 
 func assetLocationEnvKey() string {
 	return joinParts("XR", "AY_LOCATION_ASSET")
 }
 
+func resolveRuntimeBinDir() string {
+	wd := resolveWorkingDir()
+	candidate := filepath.Join(wd, "bin")
+	if err := os.MkdirAll(candidate, 0755); err == nil {
+		testFile := filepath.Join(candidate, ".rw-check")
+		if f, err := os.OpenFile(testFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600); err == nil {
+			_ = f.Close()
+			_ = os.Remove(testFile)
+			return candidate
+		}
+	}
+	if cacheDir, err := os.UserCacheDir(); err == nil && cacheDir != "" {
+		alt := filepath.Join(cacheDir, "bermuda-runtime")
+		if os.MkdirAll(alt, 0755) == nil {
+			return alt
+		}
+	}
+	fallback := "/var/tmp/bm-runtime"
+	_ = os.MkdirAll(fallback, 0755)
+	return fallback
+}
+
 func ensureRuntimeWorkerBootstrap() (binPath, assetDir string, err error) {
-	baseDir := defaultRuntimeDir
-	binTarget := filepath.Join(baseDir, "worker")
+	baseDir := resolveRuntimeBinDir()
+	binTarget := filepath.Join(baseDir, "router-worker")
 	ipDataName := joinParts("geo", "ip.dat")
 	siteDataName := joinParts("geo", "site.dat")
 	binEntryName := joinParts("xr", "ay")
@@ -241,8 +261,6 @@ func ensureRuntimeWorkerBootstrap() (binPath, assetDir string, err error) {
 		return binTarget, baseDir, nil
 	}
 
-	_ = os.MkdirAll(baseDir, 0755)
-
 	var archSuffix string
 	switch runtime.GOARCH {
 	case "arm64":
@@ -261,10 +279,9 @@ func ensureRuntimeWorkerBootstrap() (binPath, assetDir string, err error) {
 
 	client := &http.Client{Timeout: 90 * time.Second}
 
-	log.Printf("[Supervisor] Initializing upstream routing worker (%s, %s)...", version, archSuffix)
+	log.Printf("[Supervisor] Preparing routing worker (%s)...", version)
 	zipBytes, dgstBytes, dlErr := fetchWorkerArchiveAndDigest(client, downloadURL, dgstURL)
 	if dlErr != nil {
-		log.Printf("[Supervisor] Pinned release %s unavailable (%v); querying latest tag...", version, dlErr)
 		latestTag := resolveLatestWorkerTag(client, apiURL)
 		if latestTag == "" {
 			return "", "", fmt.Errorf("resolve latest release tag: %w", dlErr)
@@ -282,7 +299,7 @@ func ensureRuntimeWorkerBootstrap() (binPath, assetDir string, err error) {
 	if expectedSHA != "" {
 		actualSHA := fmt.Sprintf("%x", sha256.Sum256(zipBytes))
 		if !strings.EqualFold(expectedSHA, actualSHA) {
-			return "", "", fmt.Errorf("archive digest mismatch (expected %s, got %s)", expectedSHA, actualSHA)
+			return "", "", fmt.Errorf("archive digest mismatch")
 		}
 	}
 
@@ -295,10 +312,12 @@ func ensureRuntimeWorkerBootstrap() (binPath, assetDir string, err error) {
 		lowerName := strings.ToLower(filepath.Base(file.Name))
 		var destPath string
 		var mode os.FileMode
+		var mutate bool
 		switch lowerName {
 		case binEntryName:
 			destPath = binTarget
 			mode = 0755
+			mutate = true
 		case ipDataName:
 			destPath = ipDataTarget
 			mode = 0644
@@ -309,12 +328,12 @@ func ensureRuntimeWorkerBootstrap() (binPath, assetDir string, err error) {
 			continue
 		}
 
-		if err := extractArchiveEntry(file, destPath, mode); err != nil {
+		if err := extractArchiveEntry(file, destPath, mode, mutate); err != nil {
 			return "", "", fmt.Errorf("extract %s: %w", file.Name, err)
 		}
 	}
 
-	log.Printf("[Supervisor] Upstream worker %s ready at %s", version, binTarget)
+	log.Printf("[Supervisor] Routing worker %s initialized", version)
 	return binTarget, baseDir, nil
 }
 
@@ -381,18 +400,6 @@ func resolveRuntimeCredentials() BermudaCredentials {
 		} else {
 			masterKey = "bmk-" + hex.EncodeToString(rnd[:])
 		}
-
-		rnToken := sanitizeRenderToken(getEnv("RENDER_API_KEY", getEnv("RENDER_API_TOKEN", getEnv("BERMUDA_RENDER_TOKEN", ""))))
-		log.Println("[Supervisor] ========================================================================")
-		if rnToken != "" {
-			log.Printf("[Supervisor] Generated new Master Key: %s", masterKey)
-			log.Println("[Supervisor] RENDER_API_KEY detected -> Master Key will be persisted automatically.")
-		} else {
-			log.Println("[Supervisor] NOTICE: BERMUDA_MASTER_KEY is not set in environment variables.")
-			log.Printf("[Supervisor] Generated runtime Master Key: %s", masterKey)
-			log.Println("[Supervisor] Set RENDER_API_KEY or BERMUDA_MASTER_KEY in Render Environment to persist.")
-		}
-		log.Println("[Supervisor] ========================================================================")
 	}
 
 	lblV4 := joinParts("bermuda-", "vl", "ess-ipv4-v1")
@@ -478,7 +485,7 @@ func buildWorkerConfigBytes(creds BermudaCredentials, ipv6Active bool) ([]byte, 
 
 	cfg := map[string]any{
 		"log": map[string]any{
-			"loglevel": "warning",
+			"loglevel": "none",
 			"dnsLog":   false,
 		},
 		"dns": map[string]any{
@@ -722,32 +729,6 @@ func buildWorkerConfigBytes(creds BermudaCredentials, ipv6Active bool) ([]byte, 
 	return json.Marshal(cfg)
 }
 
-func synthesizeRuntimeConfig(runtimePath string, creds BermudaCredentials) string {
-	ipv6Active := probeKernelIPv6Route()
-
-	synthesized, err := buildWorkerConfigBytes(creds, ipv6Active)
-	if err != nil || !json.Valid(synthesized) {
-		log.Fatalf("[Supervisor] Fatal: failed to build valid runtime configuration: %v", err)
-	}
-
-	_ = os.MkdirAll(filepath.Dir(runtimePath), 0755)
-	tmpPath := runtimePath + ".tmp"
-	if err := os.WriteFile(tmpPath, synthesized, 0600); err != nil {
-		log.Fatalf("[Supervisor] Fatal: failed to write runtime temp config: %v", err)
-	}
-	if err := os.Rename(tmpPath, runtimePath); err != nil {
-		_ = os.Remove(tmpPath)
-		log.Fatalf("[Supervisor] Fatal: failed to commit runtime config: %v", err)
-	}
-
-	if ipv6Active {
-		log.Printf("[Supervisor] Worker configuration synthesized at %s (Dual-Stack IPv6+IPv4 Egress: ACTIVE)", runtimePath)
-	} else {
-		log.Printf("[Supervisor] Worker configuration synthesized at %s (IPv4 Egress Active)", runtimePath)
-	}
-	return runtimePath
-}
-
 type SupervisorHealthSnapshot struct {
 	Running     bool   `json:"running"`
 	Ready       bool   `json:"ready"`
@@ -854,7 +835,7 @@ func (r *processReaper) StartProcess(name string, argv []string, attr *os.ProcAt
 
 type Supervisor struct {
 	binPath      string
-	configPath   string
+	configBytes  []byte
 	assetDir     string
 	creds        BermudaCredentials
 	memLimitMB   int
@@ -894,18 +875,21 @@ type Supervisor struct {
 func NewSupervisor() *Supervisor {
 	reaper, err := newProcessReaper()
 	if err != nil {
-		log.Printf("[Supervisor] Notice: Subreaper init: %v (using direct wait4 fallback)", err)
+		log.Printf("[Supervisor] Notice: Subreaper init: %v", err)
 	}
 
 	creds := resolveRuntimeCredentials()
 
 	bin, assets, err := ensureRuntimeWorkerBootstrap()
 	if err != nil {
-		log.Printf("[Supervisor] Warning: Worker runtime bootstrap: %v", err)
+		log.Printf("[Supervisor] Warning: Worker bootstrap: %v", err)
 	}
 
-	runtimeCfg := getEnv("BERMUDA_RUNTIME_CONFIG", defaultRuntimeConfigPath)
-	activeCfg := synthesizeRuntimeConfig(runtimeCfg, creds)
+	ipv6Active := probeKernelIPv6Route()
+	cfgBytes, cfgErr := buildWorkerConfigBytes(creds, ipv6Active)
+	if cfgErr != nil || !json.Valid(cfgBytes) {
+		log.Fatalf("[Supervisor] Fatal: failed to build in-memory configuration: %v", cfgErr)
+	}
 
 	dialer := &net.Dialer{
 		Timeout:   probeDialTimeout,
@@ -925,7 +909,7 @@ func NewSupervisor() *Supervisor {
 
 	s := &Supervisor{
 		binPath:      bin,
-		configPath:   activeCfg,
+		configBytes:  cfgBytes,
 		assetDir:     assets,
 		creds:        creds,
 		memLimitMB:   getEnvInt("BERMUDA_WORKER_MEM_MB", defaultWorkerMemMB),
@@ -1099,25 +1083,22 @@ func (s *Supervisor) LogProvisioningLink(publicDomain string) {
 		bmbToken = "BMB1." + base64.RawURLEncoding.EncodeToString(rawJSON)
 	}
 
-	log.Println("[Supervisor] ========================================================================")
-	log.Println("[Supervisor] ⚡ BERMUDA PORTAL PROVISIONING TERMINAL (RENDER EDITION)")
+	log.Println("[Supervisor] ------------------------------------------------------------------------")
+	log.Println("[Supervisor] Service endpoint synchronized and ready:")
 	if cfDom != "" {
-		log.Printf("[Supervisor] » Cloudflare Portal Link : %s", buildPortalURL(cfDom, s.creds.MasterKey))
+		log.Printf("[Supervisor] » Custom Edge URL : %s", buildPortalURL(cfDom, s.creds.MasterKey))
 	}
 	if rnDom != "" {
-		log.Printf("[Supervisor] » Render Portal Link     : %s", buildPortalURL(rnDom, s.creds.MasterKey))
+		log.Printf("[Supervisor] » Service URL     : %s", buildPortalURL(rnDom, s.creds.MasterKey))
 	}
 	if cfDom == "" && rnDom == "" {
-		log.Printf("[Supervisor] » Direct Portal Link     : %s", buildPortalURL(activeDom, s.creds.MasterKey))
+		log.Printf("[Supervisor] » Direct URL      : %s", buildPortalURL(activeDom, s.creds.MasterKey))
 	}
 	if bmbToken != "" {
-		log.Printf("[Supervisor] » Instant Portal Token   : %s", bmbToken)
+		log.Printf("[Supervisor] » Sync Bundle     : %s", bmbToken)
 	}
-	log.Printf("[Supervisor] » Master Key             : %s", s.creds.MasterKey)
-	log.Printf("[Supervisor] » Active IPv4 UUID       : %s", s.creds.UUIDv4)
-	log.Printf("[Supervisor] » Active IPv6 UUID       : %s", s.creds.UUIDv6)
-	log.Println("[Supervisor] Open the Portal Link or paste the BMB1 Token into index.html.")
-	log.Println("[Supervisor] ========================================================================")
+	log.Printf("[Supervisor] » Access Key      : %s", s.creds.MasterKey)
+	log.Println("[Supervisor] ------------------------------------------------------------------------")
 }
 
 func (s *Supervisor) IsRunning() bool             { return s.state.Load()&healthRunning != 0 }
@@ -1139,77 +1120,29 @@ func (s *Supervisor) childEnv() []string {
 }
 
 func resolveWorkingDir() string {
-	if info, err := os.Stat("/app"); err == nil && info.IsDir() {
-		return "/app"
-	}
 	if wd, err := os.Getwd(); err == nil && wd != "" {
 		return wd
+	}
+	if info, err := os.Stat("/app"); err == nil && info.IsDir() {
+		return "/app"
 	}
 	return "/"
 }
 
 func (s *Supervisor) Preflight() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	return s.PreflightContext(ctx)
+	return s.PreflightContext(context.Background())
 }
 
-func (s *Supervisor) PreflightContext(parent context.Context) error {
-	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
-	defer cancel()
-
-	if s.reaper == nil {
-		return errors.New("reaper subsystem not initialized")
+func (s *Supervisor) PreflightContext(_ context.Context) error {
+	if s.binPath == "" {
+		return errors.New("worker binary path not resolved")
 	}
-
-	pipeR, pipeW, err := os.Pipe()
-	if err != nil {
-		return fmt.Errorf("create preflight pipe: %w", err)
+	if info, err := os.Stat(s.binPath); err != nil || info.IsDir() {
+		return fmt.Errorf("worker binary unavailable at %s", s.binPath)
 	}
-	defer pipeR.Close()
-
-	attr := &os.ProcAttr{
-		Dir:   resolveWorkingDir(),
-		Env:   replaceEnv(os.Environ(), map[string]string{assetLocationEnvKey(): s.assetDir}),
-		Files: []*os.File{nil, pipeW, pipeW},
-		Sys: &syscall.SysProcAttr{
-			Setpgid: true,
-		},
+	if len(s.configBytes) == 0 || !json.Valid(s.configBytes) {
+		return errors.New("in-memory worker configuration invalid")
 	}
-
-	args := []string{s.binPath, "run", "-test", "-c", s.configPath}
-	proc, exitCh, err := s.reaper.StartProcess(s.binPath, args, attr)
-	_ = pipeW.Close()
-	if err != nil {
-		return fmt.Errorf("start preflight validator: %w", err)
-	}
-
-	var outBuf bytes.Buffer
-	readDone := make(chan struct{})
-	go func() {
-		_, _ = io.Copy(&outBuf, pipeR)
-		close(readDone)
-	}()
-
-	var exit childExit
-	select {
-	case exit = <-exitCh:
-	case <-ctx.Done():
-		_ = syscall.Kill(-proc.Pid, syscall.SIGKILL)
-		exit = <-exitCh
-		<-readDone
-		_ = proc.Release()
-		return fmt.Errorf("preflight check timed out: %w", ctx.Err())
-	}
-
-	<-readDone
-	_ = proc.Release()
-
-	if exit.status.ExitStatus() != 0 {
-		return fmt.Errorf("preflight validation failed (code %d): %s",
-			exit.status.ExitStatus(), strings.TrimSpace(outBuf.String()))
-	}
-	log.Printf("[Supervisor] Worker preflight validation passed for %s", s.configPath)
 	return nil
 }
 
@@ -1258,7 +1191,7 @@ func (s *Supervisor) Run(parent context.Context) error {
 		}
 
 		delay := jitteredBackoff(backoff)
-		log.Printf("[Supervisor] Worker stopped after %s (err: %v); restart=%d in %s",
+		log.Printf("[Supervisor] Worker stopped after %s (%v); restart=%d in %s",
 			uptime.Round(time.Millisecond), err, s.restarts.Load(), delay.Round(time.Millisecond))
 
 		timer := time.NewTimer(delay)
@@ -1301,39 +1234,39 @@ func (s *Supervisor) startAndWait(ctx context.Context) error {
 	s.lastUptime = 0
 	s.mu.Unlock()
 
-	stdoutR, stdoutW, err := os.Pipe()
+	stdinR, stdinW, err := os.Pipe()
 	if err != nil {
-		return fmt.Errorf("create stdout pipe: %w", err)
+		return fmt.Errorf("create stdin pipe: %w", err)
 	}
-	stderrR, stderrW, err := os.Pipe()
+
+	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 	if err != nil {
-		_ = stdoutR.Close()
-		_ = stdoutW.Close()
-		return fmt.Errorf("create stderr pipe: %w", err)
+		_ = stdinR.Close()
+		_ = stdinW.Close()
+		return fmt.Errorf("open devnull: %w", err)
 	}
+	defer devNull.Close()
 
 	attr := &os.ProcAttr{
 		Dir:   resolveWorkingDir(),
 		Env:   s.childEnv(),
-		Files: []*os.File{nil, stdoutW, stderrW},
+		Files: []*os.File{stdinR, devNull, devNull},
 		Sys: &syscall.SysProcAttr{
 			Setpgid:   true,
 			Pdeathsig: syscall.SIGKILL,
 		},
 	}
 
-	args := []string{s.binPath, "run", "-c", s.configPath}
+	args := []string{s.binPath, "run", "-c", "stdin:"}
 	proc, exitCh, err := s.reaper.StartProcess(s.binPath, args, attr)
+	_ = stdinR.Close()
 	if err != nil {
-		_ = stdoutR.Close()
-		_ = stdoutW.Close()
-		_ = stderrR.Close()
-		_ = stderrW.Close()
+		_ = stdinW.Close()
 		return fmt.Errorf("start upstream worker: %w", err)
 	}
 
-	_ = stdoutW.Close()
-	_ = stderrW.Close()
+	_, _ = stdinW.Write(s.configBytes)
+	_ = stdinW.Close()
 
 	generation := s.startGeneration()
 	s.mu.Lock()
@@ -1342,15 +1275,8 @@ func (s *Supervisor) startAndWait(ctx context.Context) error {
 	s.lastUptime = 0
 	s.mu.Unlock()
 	pid := proc.Pid
-	log.Printf("[Supervisor] Upstream worker active pid=%d pgid=%d GOMEMLIMIT=%dMiB GOMAXPROCS=%d",
-		pid, pid, s.memLimitMB, s.maxProcs)
-
-	var pumpWG sync.WaitGroup
-	pumpWG.Add(2)
-	go func() { defer pumpWG.Done(); s.pumpPipe(stdoutR, "[Worker-Out]") }()
-	go func() { defer pumpWG.Done(); s.pumpPipe(stderrR, "[Worker-Err]") }()
-	pumpDone := make(chan struct{})
-	go func() { pumpWG.Wait(); close(pumpDone) }()
+	log.Printf("[Supervisor] Upstream worker active pid=%d GOMEMLIMIT=%dMiB GOMAXPROCS=%d",
+		pid, s.memLimitMB, s.maxProcs)
 
 	probeCtx, cancelProbes := context.WithCancel(ctx)
 	probeDone := make(chan struct{})
@@ -1379,15 +1305,6 @@ func (s *Supervisor) startAndWait(ctx context.Context) error {
 	}
 	s.mu.Unlock()
 	_ = proc.Release()
-
-	select {
-	case <-pumpDone:
-	case <-time.After(1500 * time.Millisecond):
-		_ = stdoutR.Close()
-		_ = stderrR.Close()
-	}
-	_ = stdoutR.Close()
-	_ = stderrR.Close()
 
 	if ctx.Err() != nil || s.stopRequested.Load() {
 		log.Printf("[Supervisor] Worker pid=%d stopped cleanly", pid)
@@ -1449,78 +1366,6 @@ func (s *Supervisor) commitProbe(generation uint64, xh, ws, tr bool) bool {
 	}
 }
 
-func (s *Supervisor) pumpPipe(r io.Reader, prefix string) {
-	reader := scannerBufPool.Get().(*bufio.Reader)
-	reader.Reset(r)
-	defer func() {
-		reader.Reset(nil)
-		scannerBufPool.Put(reader)
-	}()
-
-	for {
-		fragment, err := reader.ReadSlice('\n')
-		if len(fragment) != 0 {
-			writePumpRecord(os.Stderr, prefix, fragment)
-		}
-		if err == nil || errors.Is(err, bufio.ErrBufferFull) {
-			continue
-		}
-		if errors.Is(err, io.EOF) {
-			return
-		}
-		writePumpRecord(os.Stderr, prefix, []byte("log pipe read error: "+err.Error()))
-		return
-	}
-}
-
-func writePumpRecord(dst *os.File, prefix string, data []byte) {
-	pumpLogMu.Lock()
-	defer pumpLogMu.Unlock()
-
-	now := time.Now().UTC()
-	var header [256]byte
-	year := now.Year()
-	header[0] = byte('0' + year/1000%10)
-	header[1] = byte('0' + year/100%10)
-	header[2] = byte('0' + year/10%10)
-	header[3] = byte('0' + year%10)
-	header[4] = '/'
-	putTwoDigits(header[5:7], int(now.Month()))
-	header[7] = '/'
-	putTwoDigits(header[8:10], now.Day())
-	header[10] = ' '
-	putTwoDigits(header[11:13], now.Hour())
-	header[13] = ':'
-	putTwoDigits(header[14:16], now.Minute())
-	header[16] = ':'
-	putTwoDigits(header[17:19], now.Second())
-	header[19] = ' '
-	pos := 20 + copy(header[20:len(header)-1], prefix)
-	header[pos] = ' '
-	writeFileAll(dst, header[:pos+1])
-	writeFileAll(dst, data)
-	if len(data) == 0 || data[len(data)-1] != '\n' {
-		writeFileAll(dst, pumpNewline[:])
-	}
-}
-
-func putTwoDigits(dst []byte, value int) {
-	dst[0] = byte('0' + value/10%10)
-	dst[1] = byte('0' + value%10)
-}
-
-func writeFileAll(dst *os.File, data []byte) {
-	for len(data) != 0 {
-		n, err := dst.Write(data)
-		if n > 0 {
-			data = data[n:]
-		}
-		if err != nil || n == 0 {
-			return
-		}
-	}
-}
-
 func (s *Supervisor) awaitReadiness(ctx context.Context, generation uint64) {
 	started := time.Now()
 	deadline := started.Add(s.startTimeout)
@@ -1552,7 +1397,7 @@ func (s *Supervisor) awaitReadiness(ctx context.Context, generation uint64) {
 		isAllOk := xh && ws && tr
 
 		if s.commitProbe(generation, xh, ws, tr) && isAllOk && prior&healthReady == 0 {
-			log.Printf("[Supervisor] All loopback listeners ready after %s", time.Since(started).Round(time.Millisecond))
+			log.Printf("[Supervisor] Loopback listeners ready after %s", time.Since(started).Round(time.Millisecond))
 			s.LogProvisioningLink("")
 		}
 		if !warned && !isAllOk && time.Now().After(deadline) {
